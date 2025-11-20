@@ -35,6 +35,11 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
   String _statusMessage = 'Başlatılıyor...';
   double _totalDistance = 0.0; // Toplam mesafe (km)
   DateTime? _startTime; // İlk kayıt zamanı
+  int _totalElapsedSeconds = 0; // GPS sinyali iyi olduğunda geçen toplam süre
+  double? _lastKnownAvgSpeed; // Sinyal kaybında kullanılacak son ortalama hız
+  int _goodSignalRecoveryCount =
+      0; // Sinyal geri geldikten sonra iyi sinyal sayacı
+  bool _waitingForRecovery = false; // Sinyal geri geldikten sonra bekleme modu
 
   @override
   void initState() {
@@ -137,19 +142,81 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                 _startTime = now;
               }
 
+              // GPS sinyal kalitesini kontrol et (accuracy > 50m ise kötü)
+              final bool isGoodSignal = (position.accuracy <= 50);
+
               // Geçen süreyi hesapla
               final elapsed = now.difference(_startTime!);
 
-              // Önceki konum varsa VE 4. kayıttan sonraysa mesafe hesapla
               if (_locationHistory.isNotEmpty && _locationHistory.length >= 3) {
-                final lastLocation = _locationHistory.last;
-                final distance = Geolocator.distanceBetween(
-                  lastLocation.latitude,
-                  lastLocation.longitude,
-                  position.latitude,
-                  position.longitude,
-                );
-                _totalDistance += distance / 1000; // Metreyi km'ye çevir
+                final timeDiff = now
+                    .difference(_locationHistory.last.timestamp)
+                    .inSeconds;
+
+                if (isGoodSignal) {
+                  if (_waitingForRecovery) {
+                    // Sinyal yeni geri geldi, ardışık iyi sinyal sayısını artır
+                    _goodSignalRecoveryCount++;
+                    if (_goodSignalRecoveryCount >= 3) {
+                      // 3 iyi sinyalden sonra normal çalışmaya dön
+                      _waitingForRecovery = false;
+                      _goodSignalRecoveryCount = 0;
+                    } else {
+                      // Hala bekleme modunda, mesafe son ortalama hızla artmaya devam
+                      if (_lastKnownAvgSpeed != null &&
+                          _lastKnownAvgSpeed! > 0) {
+                        final estimatedDistance =
+                            _lastKnownAvgSpeed! * (timeDiff / 3600.0); // km
+                        _totalDistance += estimatedDistance;
+                      }
+                      // Efektif süreyi artırma - ortalama hız hesaplanmasın
+                      // Kayıt eklemeden çık
+                      _locationHistory.add(
+                        LocationRecord(
+                          latitude: position.latitude,
+                          longitude: position.longitude,
+                          timestamp: now,
+                          accuracy: position.accuracy,
+                          altitude: position.altitude,
+                          speed: position.speed,
+                          totalDistance: _totalDistance,
+                          elapsedTime: elapsed,
+                          effectiveElapsedSeconds: _totalElapsedSeconds,
+                        ),
+                      );
+                      _statusMessage = 'Kayıt: ${_locationHistory.length}';
+                      return;
+                    }
+                  }
+                  // Normal çalışmaya dönüldü
+                  _totalElapsedSeconds += timeDiff;
+                  final lastLocation = _locationHistory.last;
+                  final distance = Geolocator.distanceBetween(
+                    lastLocation.latitude,
+                    lastLocation.longitude,
+                    position.latitude,
+                    position.longitude,
+                  );
+                  _totalDistance += distance / 1000; // Metreyi km'ye çevir
+                  // Son ortalama hızı güncelle
+                  if (_totalElapsedSeconds > 0) {
+                    _lastKnownAvgSpeed =
+                        _totalDistance / (_totalElapsedSeconds / 3600.0);
+                  }
+                } else {
+                  // Sinyal kötü - recovery modunu başlat
+                  if (!_waitingForRecovery) {
+                    _waitingForRecovery = true;
+                    _goodSignalRecoveryCount = 0;
+                  }
+                  // Sinyal kötü - son ortalama hızla mesafe arttır
+                  if (_lastKnownAvgSpeed != null && _lastKnownAvgSpeed! > 0) {
+                    final estimatedDistance =
+                        _lastKnownAvgSpeed! * (timeDiff / 3600.0); // km
+                    _totalDistance += estimatedDistance;
+                  }
+                  // Efektif süreyi artırma - ortalama hız hesaplanmasın
+                }
               }
 
               _locationHistory.add(
@@ -162,6 +229,7 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                   speed: position.speed,
                   totalDistance: _totalDistance,
                   elapsedTime: elapsed,
+                  effectiveElapsedSeconds: _totalElapsedSeconds,
                 ),
               );
               _statusMessage = 'Kayıt: ${_locationHistory.length}';
@@ -229,11 +297,31 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                   // Ortalama hız hesapla (Fizik: toplam yol / geçen süre)
                   // İlk 3 kayıt için ortalama hız hesaplama (GPS stabilizasyonu için)
                   String avgSpeedText = '-';
-                  if (index >= 3 && record.elapsedTime.inSeconds > 0) {
-                    final elapsedHours = record.elapsedTime.inSeconds / 3600.0;
-                    final avgSpeedKmh =
-                        record.totalDistance / elapsedHours; // km/saat
-                    avgSpeedText = avgSpeedKmh.toStringAsFixed(2);
+                  if (index >= 3) {
+                    // GPS sinyali iyiyse yeni hesapla, kötüyse son bilinen değeri göster
+                    final bool recordHasGoodSignal =
+                        (record.accuracy != null && record.accuracy! <= 50);
+
+                    if (recordHasGoodSignal &&
+                        record.effectiveElapsedSeconds > 0) {
+                      final elapsedHours =
+                          record.effectiveElapsedSeconds / 3600.0;
+                      final avgSpeedKmh =
+                          record.totalDistance / elapsedHours; // km/saat
+                      avgSpeedText = avgSpeedKmh.toStringAsFixed(2);
+                    } else if (_lastKnownAvgSpeed != null) {
+                      // Sinyal kötü - son bilinen ortalama hızı göster
+                      avgSpeedText = _lastKnownAvgSpeed!.toStringAsFixed(2);
+                    }
+                  }
+
+                  // GPS sinyal durumunu kontrol et
+                  String accuracyText;
+                  if (record.accuracy == null || record.accuracy! > 50) {
+                    accuracyText = ' | GPS sinyali yok!';
+                  } else {
+                    accuracyText =
+                        ' | Doğruluk: ${record.accuracy!.toStringAsFixed(1)}m';
                   }
 
                   return Padding(
@@ -241,7 +329,7 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                     child: Text(
                       '${index + 1}. Enlem: ${record.latitude.toStringAsFixed(6)} | Boylam: ${record.longitude.toStringAsFixed(6)}\n'
                       '   Zaman: ${_formatDateTime(record.timestamp)} | Geçen: ${_formatDuration(record.elapsedTime)} | Hız: ${speedKmh.toStringAsFixed(2)} km/sa\n'
-                      '   Yol: ${record.totalDistance.toStringAsFixed(3)} km | Ort.Hız: $avgSpeedText km/sa${record.accuracy != null ? ' | Doğruluk: ${record.accuracy!.toStringAsFixed(1)}m' : ''}',
+                      '   Yol: ${record.totalDistance.toStringAsFixed(3)} km | Ort.Hız: $avgSpeedText km/sa$accuracyText',
                       style: const TextStyle(
                         color: Colors.white,
                         fontSize: 13,
@@ -265,6 +353,8 @@ class LocationRecord {
   final double? speed;
   final double totalDistance; // Toplam mesafe (km)
   final Duration elapsedTime; // İlk kayıttan geçen süre
+  final int
+  effectiveElapsedSeconds; // GPS sinyali iyi olduğu zamanlar için geçen süre
 
   LocationRecord({
     required this.latitude,
@@ -275,5 +365,6 @@ class LocationRecord {
     this.speed,
     required this.totalDistance,
     required this.elapsedTime,
+    required this.effectiveElapsedSeconds,
   });
 }
