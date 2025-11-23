@@ -14,6 +14,7 @@ const double MAX_REASONABLE_SPEED_KMH = 250.0; // km/h - GPS jump koruması
 const int RECOVERY_CONFIRM_COUNT = 3; // ardışık iyi sinyal sayısı
 const double VIRTUAL_RECORD_ACCURACY = 9999.0; // sanal kayıt accuracy değeri
 const int WARMUP_RECORD_COUNT = 10; // ilk 10 kayıt warm-up periyodu
+const int WARMUP_SKIP_INITIAL_SAMPLES = 3; // ilk 3 kayıt ortalama hesabına girmez
 
 void main() {
   runApp(const MyApp());
@@ -205,6 +206,19 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
   void _checkSignalLoss() {
     if (_lastProcessedTime == null) return;
 
+    // Warm-up sırasında recovery / dead reckoning devreye girmesin
+    if (_locationHistory.length < WARMUP_RECORD_COUNT) return;
+
+    // Düşük hızda (ışıkta durma vb.) sanal kayıt üretme
+    final double lastSpeedMs =
+        _locationHistory.isNotEmpty ? (_locationHistory.last.speed ?? 0.0) : 0.0;
+    final double fallbackSpeedMs = _lastKnownAvgSpeedKmh != null
+        ? _lastKnownAvgSpeedKmh! / 3.6
+        : 0.0;
+    final double effectiveSpeedMs =
+        lastSpeedMs > 0 ? lastSpeedMs : fallbackSpeedMs;
+    if (effectiveSpeedMs < 2.0) return; // <7 km/sa: recovery devreye girmez
+
     final now = DateTime.now();
     final secondsSinceLastUpdate =
         now.difference(_lastProcessedTime!).inMilliseconds / 1000.0;
@@ -311,12 +325,12 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
             // Anlık hız hesapla (km/h)
             final instantSpeedKmh = (distanceKm / timeDiffSec) * 3600.0;
 
-            // Warm-up: İyi sinyal + makul hız kontrolü
-            if (isGoodSignal && instantSpeedKmh <= MAX_REASONABLE_SPEED_KMH) {
-              // Anlık hızı listeye ekle (sıfır hız dahil)
-              _warmupSpeedSamples.add(instantSpeedKmh);
+            final bool canUseForWarmupAvg =
+                _locationHistory.length >= WARMUP_SKIP_INITIAL_SAMPLES;
 
-              // Display metriklerini güncelle
+            // Warm-up: İyi sinyal + makul hız kontrolü + ilk 2 kaydı ortalama dışı
+            if (isGoodSignal && instantSpeedKmh <= MAX_REASONABLE_SPEED_KMH) {
+              // Hareketi ekrana yansıt
               _displayDistance += distanceKm;
               _displayElapsedSeconds += timeDiffSec;
 
@@ -324,10 +338,14 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
               _lastKnownLat = position.latitude;
               _lastKnownLon = position.longitude;
 
-              // Aritmetik ortalama hesapla
-              if (_warmupSpeedSamples.isNotEmpty) {
-                final sumSpeed = _warmupSpeedSamples.reduce((a, b) => a + b);
-                _lastKnownAvgSpeedKmh = sumSpeed / _warmupSpeedSamples.length;
+              if (canUseForWarmupAvg) {
+                // Anlık hızı listeye ekle (sıfır hız dahil)
+                _warmupSpeedSamples.add(instantSpeedKmh);
+
+                if (_warmupSpeedSamples.isNotEmpty) {
+                  final sumSpeed = _warmupSpeedSamples.reduce((a, b) => a + b);
+                  _lastKnownAvgSpeedKmh = sumSpeed / _warmupSpeedSamples.length;
+                }
               }
             } else if (!isGoodSignal) {
               // Kötü sinyal - tahmini mesafe ekle
@@ -522,10 +540,13 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
   Widget build(BuildContext context) {
     final bool hasData = _locationHistory.isNotEmpty;
     final record = hasData ? _locationHistory.last : null;
-    final lastRecordGoodSignal =
-        record != null &&
+    final bool lastRecordLowSpeed =
+        record?.speed != null ? record!.speed! < 2.0 : false; // <7 km/sa
+    final double lastRecordAccuracyThreshold =
+        lastRecordLowSpeed ? 100.0 : GPS_ACCURACY_THRESHOLD;
+    final lastRecordGoodSignal = record != null &&
         record.accuracy != null &&
-        record.accuracy! <= GPS_ACCURACY_THRESHOLD;
+        record.accuracy! <= lastRecordAccuracyThreshold;
     final currentAvg = _currentAverageKmh(lastRecordGoodSignal);
     final speedKmh = record?.speed != null ? (record!.speed! * 3.6) : null;
     final elapsedDuration = Duration(seconds: _displayElapsedSeconds.round());
@@ -642,6 +663,8 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                               avgSpeedText =
                                   '${avgSpeed.toStringAsFixed(2)} (W)';
                             }
+                          } else {
+                            avgSpeedText = 'Hesaplanıyor...';
                           }
                         } else {
                           // Normal ortalama göster
