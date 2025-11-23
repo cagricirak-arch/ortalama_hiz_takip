@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:permission_handler/permission_handler.dart' as ph;
+import 'package:permission_handler/permission_handler.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'dart:async';
 
 // ============================================================================
@@ -80,6 +81,7 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
     _positionSubscription?.cancel();
     _watchdogTimer?.cancel();
     _scrollController.dispose();
+    WakelockPlus.disable();
     super.dispose();
   }
 
@@ -122,7 +124,7 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
         });
 
         // Arka plan izni için permission_handler kullan
-        var backgroundStatus = await ph.Permission.locationAlways.request();
+        var backgroundStatus = await Permission.locationAlways.request();
 
         if (backgroundStatus.isDenied) {
           setState(() {
@@ -147,6 +149,9 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
   }
 
   void _startTracking() {
+    // Ekranı açık tut
+    WakelockPlus.enable();
+
     // Platform bazlı ayarlar
     final LocationSettings locationSettings;
 
@@ -154,7 +159,10 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
       // iOS için özel ayarlar - arka plan optimizasyonu
       locationSettings = AppleSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 10, // Pil tasarrufu için 10m
+        // Simülatörde iyi çalışan ama gerçek cihazda bekleyen tek kayıt
+        // sorununu çözmek için mesafe filtresini sıfıra çektik; zaman
+        // bazlı güncellemeler gelsin diye.
+        distanceFilter: 0,
         pauseLocationUpdatesAutomatically: false,
         activityType: ActivityType.automotiveNavigation,
         showBackgroundLocationIndicator: true,
@@ -260,7 +268,24 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
       }
 
       // GPS sinyal kalitesini kontrol et
-      final bool isGoodSignal = (position.accuracy <= GPS_ACCURACY_THRESHOLD);
+      // Warm-up fazında daha esnek, normal fazda daha sıkı
+      final double currentSpeedMs = position.speed; // m/s
+      final bool isLowSpeed = currentSpeedMs < 2.0; // 2 m/s ≈ 7 km/h
+      final bool isWarmupPhase = _locationHistory.length < WARMUP_RECORD_COUNT;
+
+      // Warm-up: 500m eşik (çok çok esnek - gerçek iPhone için)
+      // Normal + Düşük hız: 100m eşik (esnek)
+      // Normal + Hızlı: 50m eşik (sıkı)
+      final double accuracyThreshold = isWarmupPhase
+          ? 500.0
+          : (isLowSpeed ? 100.0 : GPS_ACCURACY_THRESHOLD);
+      final bool isGoodSignal = position.accuracy <= accuracyThreshold;
+
+      debugPrint(
+        '📍 GPS: accuracy=${position.accuracy.toStringAsFixed(1)}m, '
+        'speed=${(currentSpeedMs * 3.6).toStringAsFixed(1)} km/h, '
+        'isGoodSignal=$isGoodSignal, warmup=$isWarmupPhase',
+      );
 
       // Geçen süreyi hesapla (DOUBLE HASSASİYET)
       final elapsed = now.difference(_startTime!);
@@ -286,13 +311,9 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
             // Anlık hız hesapla (km/h)
             final instantSpeedKmh = (distanceKm / timeDiffSec) * 3600.0;
 
-            // Warm-up periyodunda sadece iyi sinyal ve makul hızları topla
-            // İLK KAYIT SONRASI: 2. kayıttan itibaren hesaplamaya başla
-            if (isGoodSignal &&
-                instantSpeedKmh <= MAX_REASONABLE_SPEED_KMH &&
-                _locationHistory.length >= 1) {
-              // En az 1 kayıt var (şu an 2. eklenecek)
-              // Anlık hızı listeye ekle
+            // Warm-up: İyi sinyal + makul hız kontrolü
+            if (isGoodSignal && instantSpeedKmh <= MAX_REASONABLE_SPEED_KMH) {
+              // Anlık hızı listeye ekle (sıfır hız dahil)
               _warmupSpeedSamples.add(instantSpeedKmh);
 
               // Display metriklerini güncelle
@@ -308,23 +329,16 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                 final sumSpeed = _warmupSpeedSamples.reduce((a, b) => a + b);
                 _lastKnownAvgSpeedKmh = sumSpeed / _warmupSpeedSamples.length;
               }
-
-              debugPrint(
-                '🔥 WARM-UP: Kayıt ${_locationHistory.length + 1}/$WARMUP_RECORD_COUNT | '
-                'Anlık=${instantSpeedKmh.toStringAsFixed(2)} km/h, '
-                'Aritmetik Ort=${_lastKnownAvgSpeedKmh?.toStringAsFixed(2)} km/h',
-              );
-            } else {
-              // İlk kayıt, kötü sinyal veya GPS jump
-              // Sadece 2. kayıttan sonra tahmini mesafe ekle
-              if (_locationHistory.length > 0 &&
-                  _lastKnownAvgSpeedKmh != null) {
+            } else if (!isGoodSignal) {
+              // Kötü sinyal - tahmini mesafe ekle
+              if (_lastKnownAvgSpeedKmh != null) {
                 final estimatedDistance =
                     _lastKnownAvgSpeedKmh! * (timeDiffSec / 3600.0);
                 _displayDistance += estimatedDistance;
                 _displayElapsedSeconds += timeDiffSec;
               }
             }
+            // GPS jump durumunda (instantSpeedKmh > 250) hiçbir şey ekleme
           }
         } else {
           // İlk kayıt
@@ -357,13 +371,6 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
         if (_locationHistory.length == WARMUP_RECORD_COUNT) {
           _avgDistance = _displayDistance;
           _avgElapsedSeconds = _displayElapsedSeconds;
-
-          debugPrint(
-            '✅ WARM-UP TAMAMLANDI! Aritmetik Ortalama: ${_lastKnownAvgSpeedKmh?.toStringAsFixed(2)} km/h',
-          );
-          debugPrint(
-            '   Başlangıç metrikleri: Mesafe=${_avgDistance.toStringAsFixed(3)} km, Süre=${_avgElapsedSeconds.toStringAsFixed(1)}s',
-          );
         }
 
         if (_locationHistory.isNotEmpty) {
@@ -383,6 +390,7 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
             final instantSpeedKmh = (distanceKm / timeDiffSec) * 3600.0;
 
             if (isGoodSignal && instantSpeedKmh <= MAX_REASONABLE_SPEED_KMH) {
+              // İyi sinyal ve makul hız - normal işlem
               _displayDistance += distanceKm;
               _displayElapsedSeconds += timeDiffSec;
               _avgDistance += distanceKm;
@@ -400,19 +408,34 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                 }
               }
             } else {
-              if (!_waitingForRecovery) {
-                _waitingForRecovery = true;
-                _goodSignalRecoveryCount = 0;
+              // Kötü sinyal veya GPS sıçraması
+              // RECOVERY MODE: Sadece araç hızlıyken (>7 km/h) uygula
+              // Araç yavaş/duruyorsa sadece süre geçsin, ortalama düşsün
+              final bool shouldUseRecovery = currentSpeedMs >= 2.0; // 7 km/h
+
+              if (shouldUseRecovery) {
+                // Araç hızlı, sinyal kötü → Dead Reckoning
+                if (!_waitingForRecovery) {
+                  _waitingForRecovery = true;
+                  _goodSignalRecoveryCount = 0;
+                }
+
+                final estimatedDistance =
+                    (_lastKnownAvgSpeedKmh ?? 0.0) * (timeDiffSec / 3600.0);
+                _displayDistance += estimatedDistance;
+                _displayElapsedSeconds += timeDiffSec;
+
+                _statusMessage = isGoodSignal
+                    ? 'GPS Sıçraması Tespit Edildi'
+                    : 'GPS Sinyali Zayıf';
+              } else {
+                // Araç yavaş/duruyor, sinyal kötü → Sadece süre geçsin
+                // Mesafe ekleme, ortalama düşsün
+                _displayElapsedSeconds += timeDiffSec;
+                _avgElapsedSeconds += timeDiffSec;
+
+                _statusMessage = 'Düşük Hız - GPS Zayıf (Ortalama Düşüyor)';
               }
-
-              final estimatedDistance =
-                  (_lastKnownAvgSpeedKmh ?? 0.0) * (timeDiffSec / 3600.0);
-              _displayDistance += estimatedDistance;
-              _displayElapsedSeconds += timeDiffSec;
-
-              _statusMessage = isGoodSignal
-                  ? 'GPS Sıçraması Tespit Edildi'
-                  : 'GPS Sinyali Zayıf';
             }
           }
         }
@@ -542,8 +565,9 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                                 : '-',
                           ),
                           style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 14,
+                            color: Colors.white,
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
                         Text(
@@ -554,8 +578,9 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                                 : '-',
                           ),
                           style: const TextStyle(
-                            color: Colors.white70,
-                            fontSize: 14,
+                            color: Colors.white,
+                            fontSize: 20,
+                            fontWeight: FontWeight.bold,
                           ),
                         ),
                         Text(
@@ -567,7 +592,7 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                           ),
                           style: const TextStyle(
                             color: Colors.white70,
-                            fontSize: 14,
+                            fontSize: 16,
                           ),
                         ),
                         Text(
@@ -577,7 +602,7 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                           ),
                           style: const TextStyle(
                             color: Colors.white70,
-                            fontSize: 14,
+                            fontSize: 16,
                           ),
                         ),
                       ],
