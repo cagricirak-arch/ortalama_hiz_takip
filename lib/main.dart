@@ -12,9 +12,12 @@ const double MIN_UPDATE_INTERVAL_SEC = 2.8; // saniye - throttling limiti
 const double SIGNAL_LOSS_TIMEOUT_SEC = 5.0; // saniye - sinyal kayıp timeout
 const double MAX_REASONABLE_SPEED_KMH = 250.0; // km/h - GPS jump koruması
 const int RECOVERY_CONFIRM_COUNT = 3; // ardışık iyi sinyal sayısı
+const double MIN_RECOVERY_SPEED_MS =
+    5.6; // m/s ≈ 20 km/h - recovery devreye giriş
 const double VIRTUAL_RECORD_ACCURACY = 9999.0; // sanal kayıt accuracy değeri
 const int WARMUP_RECORD_COUNT = 10; // ilk 10 kayıt warm-up periyodu
-const int WARMUP_SKIP_INITIAL_SAMPLES = 3; // ilk 3 kayıt ortalama hesabına girmez
+const int WARMUP_SKIP_INITIAL_SAMPLES =
+    3; // ilk 3 kayıt ortalama hesabına girmez
 
 void main() {
   runApp(const MyApp());
@@ -70,6 +73,19 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
   // Last known position for dead reckoning
   double? _lastKnownLat;
   double? _lastKnownLon;
+
+  // Retrospektif hesaplama için sinyal kaybı verisi
+  double? _signalLostLat; // Sinyal kaybolduğunda konum
+  double? _signalLostLon;
+  DateTime? _signalLostTime; // Sinyal kaybolma zamanı
+  double _estimatedDistanceDuringLoss =
+      0.0; // Kayıp süresinde tahmini mesafe (ekran için)
+  double _avgDistanceAtSignalLoss = 0.0; // Sinyal kaybolduğundaki avgDistance
+  double _avgElapsedAtSignalLoss =
+      0.0; // Sinyal kaybolduğundaki avgElapsedSeconds
+  double _displayDistanceAtSignalLoss =
+      0.0; // Sinyal kaybolduğundaki displayDistance
+  int _virtualRecordStartIndex = -1; // Sanal kayıtların başladığı index
 
   @override
   void initState() {
@@ -210,14 +226,17 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
     if (_locationHistory.length < WARMUP_RECORD_COUNT) return;
 
     // Düşük hızda (ışıkta durma vb.) sanal kayıt üretme
-    final double lastSpeedMs =
-        _locationHistory.isNotEmpty ? (_locationHistory.last.speed ?? 0.0) : 0.0;
+    final double lastSpeedMs = _locationHistory.isNotEmpty
+        ? (_locationHistory.last.speed ?? 0.0)
+        : 0.0;
     final double fallbackSpeedMs = _lastKnownAvgSpeedKmh != null
         ? _lastKnownAvgSpeedKmh! / 3.6
         : 0.0;
-    final double effectiveSpeedMs =
-        lastSpeedMs > 0 ? lastSpeedMs : fallbackSpeedMs;
-    if (effectiveSpeedMs < 2.0) return; // <7 km/sa: recovery devreye girmez
+    final double effectiveSpeedMs = lastSpeedMs > 0
+        ? lastSpeedMs
+        : fallbackSpeedMs;
+    if (effectiveSpeedMs < MIN_RECOVERY_SPEED_MS)
+      return; // <20 km/sa: recovery devreye girmez
 
     final now = DateTime.now();
     final secondsSinceLastUpdate =
@@ -227,6 +246,27 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
       // Sinyal kayıp - Dead Reckoning uygula
       if (_lastKnownAvgSpeedKmh != null && _lastKnownAvgSpeedKmh! > 0) {
         setState(() {
+          // Recovery moduna gir (eğer henüz değilse)
+          if (!_waitingForRecovery) {
+            _waitingForRecovery = true;
+            _goodSignalRecoveryCount = 0;
+
+            // Sinyal kaybı başlangıç noktasını kaydet
+            _signalLostLat = _lastKnownLat;
+            _signalLostLon = _lastKnownLon;
+            _signalLostTime = _lastProcessedTime;
+            _estimatedDistanceDuringLoss = 0.0;
+            _avgDistanceAtSignalLoss = _avgDistance;
+            _avgElapsedAtSignalLoss = _avgElapsedSeconds;
+            _displayDistanceAtSignalLoss = _displayDistance;
+            _virtualRecordStartIndex = _locationHistory
+                .length; // Sanal kayıtlar bu indexten başlayacak
+
+            debugPrint(
+              '📡 WATCHDOG SİNYAL KAYIP: Konum=(${_lastKnownLat?.toStringAsFixed(6)}, ${_lastKnownLon?.toStringAsFixed(6)})',
+            );
+          }
+
           // Geçen süreyi hesapla
           final timeDiffSec = secondsSinceLastUpdate;
           final estimatedDistance =
@@ -234,6 +274,7 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
 
           _displayDistance += estimatedDistance;
           _displayElapsedSeconds += timeDiffSec;
+          _estimatedDistanceDuringLoss += estimatedDistance;
 
           // Sanal kayıt ekle
           _locationHistory.add(
@@ -253,7 +294,8 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
           );
 
           _lastProcessedTime = now;
-          _statusMessage = 'Sinyal Kayıp - Dead Reckoning Aktif';
+          _statusMessage =
+              'Sinyal Kayıp - Tahmini Mesafe (Retrospektif Bekleniyor)';
 
           _scrollToBottom();
         });
@@ -284,7 +326,8 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
       // GPS sinyal kalitesini kontrol et
       // Warm-up fazında daha esnek, normal fazda daha sıkı
       final double currentSpeedMs = position.speed; // m/s
-      final bool isLowSpeed = currentSpeedMs < 2.0; // 2 m/s ≈ 7 km/h
+      final bool isLowSpeed =
+          currentSpeedMs < MIN_RECOVERY_SPEED_MS; // <20 km/h
       final bool isWarmupPhase = _locationHistory.length < WARMUP_RECORD_COUNT;
 
       // Warm-up: 500m eşik (çok çok esnek - gerçek iPhone için)
@@ -408,47 +451,177 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
             final instantSpeedKmh = (distanceKm / timeDiffSec) * 3600.0;
 
             if (isGoodSignal && instantSpeedKmh <= MAX_REASONABLE_SPEED_KMH) {
-              // İyi sinyal ve makul hız - normal işlem
-              _displayDistance += distanceKm;
-              _displayElapsedSeconds += timeDiffSec;
-              _avgDistance += distanceKm;
-              _avgElapsedSeconds += timeDiffSec;
-
-              _lastKnownLat = position.latitude;
-              _lastKnownLon = position.longitude;
+              // İyi sinyal ve makul hız
 
               if (_waitingForRecovery) {
+                // Recovery modunda - ardışık iyi sinyal say
                 _goodSignalRecoveryCount++;
-                if (_goodSignalRecoveryCount >= RECOVERY_CONFIRM_COUNT) {
-                  _waitingForRecovery = false;
-                  _goodSignalRecoveryCount = 0;
-                  _statusMessage = 'GPS Sinyali İyi';
+
+                if (_goodSignalRecoveryCount == 1) {
+                  // İLK İYİ SİNYAL - Chord hesaplaması yap
+
+                  // Sinyal kaybı noktasından ilk iyi sinyale chord hesapla
+                  if (_signalLostLat != null &&
+                      _signalLostLon != null &&
+                      _signalLostTime != null) {
+                    final chordDistanceMeters = Geolocator.distanceBetween(
+                      _signalLostLat!,
+                      _signalLostLon!,
+                      position.latitude,
+                      position.longitude,
+                    );
+                    final chordDistanceKm = chordDistanceMeters / 1000.0;
+                    final chordTimeSec =
+                        now.difference(_signalLostTime!).inMilliseconds /
+                        1000.0;
+
+                    // Chord hızını hesapla ve doğrula
+                    final chordSpeedKmh = chordTimeSec > 0
+                        ? chordDistanceKm / (chordTimeSec / 3600.0)
+                        : 0.0;
+
+                    debugPrint(
+                      '🔄 CHORD HESABI: Mesafe=${chordDistanceKm.toStringAsFixed(3)} km, '
+                      'Süre=${chordTimeSec.toStringAsFixed(1)} sn, '
+                      'Chord Hız=${chordSpeedKmh.toStringAsFixed(1)} km/h',
+                    );
+
+                    if (chordSpeedKmh <= MAX_REASONABLE_SPEED_KMH &&
+                        chordSpeedKmh >= 0) {
+                      // Chord geçerli - retrospektif düzeltme yap
+                      // Display mesafesini düzelt (tahmini çıkar, gerçek ekle)
+                      _displayDistance -= _estimatedDistanceDuringLoss;
+                      _displayDistance += chordDistanceKm;
+
+                      // Ortalama hesabına gerçek değerleri ekle
+                      _avgDistance = _avgDistanceAtSignalLoss + chordDistanceKm;
+                      _avgElapsedSeconds =
+                          _avgElapsedAtSignalLoss + chordTimeSec;
+
+                      // Sanal kayıtları GERÇEK DEĞERLERLE güncelle
+                      _updateAndMarkVirtualRecords(
+                        chordDistanceKm,
+                        chordTimeSec,
+                      );
+
+                      debugPrint(
+                        '✅ CHORD UYGULAND: Tahmini=${_estimatedDistanceDuringLoss.toStringAsFixed(3)} km → '
+                        'Gerçek=${chordDistanceKm.toStringAsFixed(3)} km',
+                      );
+
+                      _statusMessage =
+                          'Recovery 1/$RECOVERY_CONFIRM_COUNT - Chord Düzeltildi';
+                    } else {
+                      // Chord geçersiz (GPS sıçraması) - tahminleri koru ve ortalamaya entegre et
+                      final fallbackDistanceKm = _estimatedDistanceDuringLoss;
+                      final fallbackTimeSec = chordTimeSec;
+
+                      // Ortalama hesabına tahmini değerleri ekle (kayıp süreyi yok saymamak için)
+                      _avgDistance =
+                          _avgDistanceAtSignalLoss + fallbackDistanceKm;
+                      _avgElapsedSeconds =
+                          _avgElapsedAtSignalLoss + fallbackTimeSec;
+
+                      // Sanal kayıtları tahmini değerlerle güncelle/işaretle
+                      _updateAndMarkVirtualRecords(
+                        fallbackDistanceKm,
+                        fallbackTimeSec,
+                      );
+
+                      debugPrint(
+                        '⚠️ CHORD GEÇERSİZ: Hız=${chordSpeedKmh.toStringAsFixed(1)} km/h > MAX=$MAX_REASONABLE_SPEED_KMH '
+                        '(Tahmin korundu, ortalama güncellendi)',
+                      );
+                      _statusMessage =
+                          'Recovery 1/$RECOVERY_CONFIRM_COUNT - GPS Sıçraması (Tahmin Korundu)';
+                    }
+                  }
+
+                  // Son bilinen konumu güncelle
+                  _lastKnownLat = position.latitude;
+                  _lastKnownLon = position.longitude;
+                } else if (_goodSignalRecoveryCount >= 2 &&
+                    _goodSignalRecoveryCount < RECOVERY_CONFIRM_COUNT) {
+                  // 2. İYİ SİNYAL - Gerçek mesafe ekle (tahmin DEĞİL)
+                  _displayDistance += distanceKm;
+                  _displayElapsedSeconds += timeDiffSec;
+                  _avgDistance += distanceKm;
+                  _avgElapsedSeconds += timeDiffSec;
+
+                  _lastKnownLat = position.latitude;
+                  _lastKnownLon = position.longitude;
+
+                  _statusMessage =
+                      'Recovery $_goodSignalRecoveryCount/$RECOVERY_CONFIRM_COUNT - Doğrulama';
+                } else if (_goodSignalRecoveryCount >= RECOVERY_CONFIRM_COUNT) {
+                  // 3. İYİ SİNYAL - Recovery tamamlandı
+                  // Gerçek mesafe ekle
+                  _displayDistance += distanceKm;
+                  _displayElapsedSeconds += timeDiffSec;
+                  _avgDistance += distanceKm;
+                  _avgElapsedSeconds += timeDiffSec;
+
+                  // Son bilinen konumu güncelle
+                  _lastKnownLat = position.latitude;
+                  _lastKnownLon = position.longitude;
+
+                  // Reset tüm snapshot alanları
+                  _resetRecoveryState();
+
+                  _statusMessage = 'GPS Geri Geldi - Recovery Tamamlandı ✅';
                 }
+              } else {
+                // Normal mod - sinyal iyi, normal mesafe ekle
+                _displayDistance += distanceKm;
+                _displayElapsedSeconds += timeDiffSec;
+                _avgDistance += distanceKm;
+                _avgElapsedSeconds += timeDiffSec;
+
+                _lastKnownLat = position.latitude;
+                _lastKnownLon = position.longitude;
               }
             } else {
               // Kötü sinyal veya GPS sıçraması
-              // RECOVERY MODE: Sadece araç hızlıyken (>7 km/h) uygula
-              // Araç yavaş/duruyorsa sadece süre geçsin, ortalama düşsün
-              final bool shouldUseRecovery = currentSpeedMs >= 2.0; // 7 km/h
+              // RECOVERY MODE: Sadece araç hızlıyken (>20 km/h) uygula
+              final bool shouldUseRecovery =
+                  currentSpeedMs >= MIN_RECOVERY_SPEED_MS; // 20 km/h
 
               if (shouldUseRecovery) {
-                // Araç hızlı, sinyal kötü → Dead Reckoning
+                // Araç hızlı, sinyal kötü → Recovery moduna gir
                 if (!_waitingForRecovery) {
+                  // İlk kez kötü sinyal - sinyal kaybı verilerini kaydet
                   _waitingForRecovery = true;
+                  _goodSignalRecoveryCount = 0;
+
+                  // Sinyal kaybı başlangıç noktasını kaydet
+                  _signalLostLat = _lastKnownLat;
+                  _signalLostLon = _lastKnownLon;
+                  _signalLostTime = _lastProcessedTime;
+                  _estimatedDistanceDuringLoss = 0.0;
+                  _avgDistanceAtSignalLoss = _avgDistance;
+                  _avgElapsedAtSignalLoss = _avgElapsedSeconds;
+                  _displayDistanceAtSignalLoss = _displayDistance;
+
+                  debugPrint(
+                    '📡 SİNYAL KAYIP: Konum=(${_lastKnownLat?.toStringAsFixed(6)}, ${_lastKnownLon?.toStringAsFixed(6)})',
+                  );
+                } else {
+                  // Recovery sırasında yeniden kötü sinyal geldi; ardışık iyi sinyal sayacını sıfırla
                   _goodSignalRecoveryCount = 0;
                 }
 
+                // Tahmini mesafe ekle (ekran için)
                 final estimatedDistance =
                     (_lastKnownAvgSpeedKmh ?? 0.0) * (timeDiffSec / 3600.0);
                 _displayDistance += estimatedDistance;
                 _displayElapsedSeconds += timeDiffSec;
+                _estimatedDistanceDuringLoss += estimatedDistance;
 
                 _statusMessage = isGoodSignal
                     ? 'GPS Sıçraması Tespit Edildi'
-                    : 'GPS Sinyali Zayıf';
+                    : 'GPS Sinyali Zayıf - Tahmini Mesafe';
               } else {
                 // Araç yavaş/duruyor, sinyal kötü → Sadece süre geçsin
-                // Mesafe ekleme, ortalama düşsün
                 _displayElapsedSeconds += timeDiffSec;
                 _avgElapsedSeconds += timeDiffSec;
 
@@ -500,6 +673,71 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
     });
   }
 
+  void _resetRecoveryState() {
+    _waitingForRecovery = false;
+    _goodSignalRecoveryCount = 0;
+    _signalLostLat = null;
+    _signalLostLon = null;
+    _signalLostTime = null;
+    _estimatedDistanceDuringLoss = 0.0;
+    _avgDistanceAtSignalLoss = 0.0;
+    _avgElapsedAtSignalLoss = 0.0;
+    _displayDistanceAtSignalLoss = 0.0;
+    _virtualRecordStartIndex = -1;
+  }
+
+  /// Sanal kayıtları gerçek değerlerle güncelle ve "recovered" olarak işaretle
+  void _updateAndMarkVirtualRecords(double realDistanceKm, double realTimeSec) {
+    if (_virtualRecordStartIndex < 0 ||
+        _virtualRecordStartIndex >= _locationHistory.length) {
+      return;
+    }
+
+    // Sanal kayıt sayısını bul
+    int virtualCount = 0;
+    for (int i = _virtualRecordStartIndex; i < _locationHistory.length; i++) {
+      if (_locationHistory[i].isVirtual) {
+        virtualCount++;
+      }
+    }
+
+    if (virtualCount == 0) return;
+
+    // Her sanal kayıt için gerçek mesafe ve süreyi orantılı dağıt
+    final distancePerRecord = realDistanceKm / virtualCount;
+    final timePerRecord = realTimeSec / virtualCount;
+
+    double cumulativeDistance = _displayDistanceAtSignalLoss;
+    double cumulativeAvgDistance = _avgDistanceAtSignalLoss;
+    double cumulativeAvgTime = _avgElapsedAtSignalLoss;
+
+    for (int i = _virtualRecordStartIndex; i < _locationHistory.length; i++) {
+      final rec = _locationHistory[i];
+      if (rec.isVirtual && !rec.isRecovered) {
+        cumulativeDistance += distancePerRecord;
+        cumulativeAvgDistance += distancePerRecord;
+        cumulativeAvgTime += timePerRecord;
+
+        _locationHistory[i] = LocationRecord(
+          latitude: rec.latitude,
+          longitude: rec.longitude,
+          timestamp: rec.timestamp,
+          accuracy: rec.accuracy,
+          altitude: rec.altitude,
+          speed: rec.speed,
+          totalDistance: cumulativeDistance,
+          averageDistance: cumulativeAvgDistance,
+          elapsedTime: rec.elapsedTime,
+          effectiveElapsedSeconds: cumulativeAvgTime,
+          isVirtual: true,
+          isRecovered: true,
+        );
+      }
+    }
+
+    debugPrint('🔄 $virtualCount sanal kayıt GERÇEK DEĞERLERLE güncellendi');
+  }
+
   String _formatDateTime(DateTime dateTime) {
     return '${dateTime.day.toString().padLeft(2, '0')}/'
         '${dateTime.month.toString().padLeft(2, '0')}/'
@@ -540,11 +778,14 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
   Widget build(BuildContext context) {
     final bool hasData = _locationHistory.isNotEmpty;
     final record = hasData ? _locationHistory.last : null;
-    final bool lastRecordLowSpeed =
-        record?.speed != null ? record!.speed! < 2.0 : false; // <7 km/sa
-    final double lastRecordAccuracyThreshold =
-        lastRecordLowSpeed ? 100.0 : GPS_ACCURACY_THRESHOLD;
-    final lastRecordGoodSignal = record != null &&
+    final bool lastRecordLowSpeed = record?.speed != null
+        ? record!.speed! < MIN_RECOVERY_SPEED_MS
+        : false; // <20 km/sa
+    final double lastRecordAccuracyThreshold = lastRecordLowSpeed
+        ? 100.0
+        : GPS_ACCURACY_THRESHOLD;
+    final lastRecordGoodSignal =
+        record != null &&
         record.accuracy != null &&
         record.accuracy! <= lastRecordAccuracyThreshold;
     final currentAvg = _currentAverageKmh(lastRecordGoodSignal);
@@ -687,14 +928,22 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
 
                         // GPS sinyal durumu veya sanal kayıt kontrolü
                         String statusText;
-                        if (record.isVirtual) {
+                        Color recordColor = Colors.white;
+
+                        if (record.isVirtual && record.isRecovered) {
+                          statusText = ' | 🔄 RECOVERED';
+                          recordColor = Colors.blue;
+                        } else if (record.isVirtual) {
                           statusText = ' | 🔴 SANAL KAYIT (Dead Reckoning)';
+                          recordColor = Colors.orange;
                         } else if (record.accuracy == null ||
                             record.accuracy! > GPS_ACCURACY_THRESHOLD) {
                           statusText = ' | ⚠️ GPS Zayıf';
+                          recordColor = Colors.yellow;
                         } else {
                           statusText =
                               ' | ✅ ${record.accuracy!.toStringAsFixed(1)}m';
+                          recordColor = Colors.white;
                         }
 
                         return Padding(
@@ -704,9 +953,7 @@ class _LocationTrackerPageState extends State<LocationTrackerPage> {
                             '   ${_formatDateTime(record.timestamp)} | ${_formatDuration(record.elapsedTime)} | ${speedKmh.toStringAsFixed(2)} km/h\n'
                             '   Yol: ${record.totalDistance.toStringAsFixed(3)} km | Ort: $avgSpeedText km/h$statusText',
                             style: TextStyle(
-                              color: record.isVirtual
-                                  ? Colors.orange
-                                  : Colors.white,
+                              color: recordColor,
                               fontSize: 13,
                               fontFamily: 'monospace',
                             ),
@@ -736,6 +983,7 @@ class LocationRecord {
   final double
   effectiveElapsedSeconds; // GPS sinyali iyi olduğu zamanlar için geçen süre (double)
   final bool isVirtual; // Dead reckoning sanal kaydı mı?
+  final bool isRecovered; // Retrospektif düzeltme sonrası işaretlenen kayıt
 
   LocationRecord({
     required this.latitude,
@@ -749,5 +997,24 @@ class LocationRecord {
     required this.elapsedTime,
     required this.effectiveElapsedSeconds,
     this.isVirtual = false,
+    this.isRecovered = false,
   });
+
+  /// Kayıt kopyası oluştur (isRecovered değiştirmek için)
+  LocationRecord copyWith({bool? isRecovered}) {
+    return LocationRecord(
+      latitude: latitude,
+      longitude: longitude,
+      timestamp: timestamp,
+      accuracy: accuracy,
+      altitude: altitude,
+      speed: speed,
+      totalDistance: totalDistance,
+      averageDistance: averageDistance,
+      elapsedTime: elapsedTime,
+      effectiveElapsedSeconds: effectiveElapsedSeconds,
+      isVirtual: isVirtual,
+      isRecovered: isRecovered ?? this.isRecovered,
+    );
+  }
 }
